@@ -14,7 +14,11 @@ from pathlib import Path
 
 import pytest
 
-from cronometer_api_mcp.client import CronometerClient, CronometerError
+from cronometer_api_mcp.client import (
+    CronometerClient,
+    CronometerError,
+    _normalize_barcodes,
+)
 
 # Real response body observed from an expired session.
 REAL_FAIL_BODY = {"result": "FAIL", "error": "Token Authorization failed"}
@@ -906,6 +910,100 @@ def test_create_custom_food_extra_nutrients_overlap_raises(tmp_path):
             carbs_g=20,
             extra_nutrients={204: 5.0},  # fat -- already set by fat_g
         )
+
+
+# ---------------------------------------------------------------------------
+# create_custom_food: barcodes
+# ---------------------------------------------------------------------------
+
+
+def _create_test_food(client, **kwargs):
+    return client.create_custom_food(
+        "Test Food", calories=200, protein_g=10, fat_g=5, carbs_g=20, **kwargs
+    )
+
+
+def test_create_custom_food_sends_normalized_barcodes(tmp_path):
+    """Barcodes go out as the food's `barcodes` list of bare digit strings,
+    the shape get_food reports for branded foods."""
+    client, state = make_cold_client(tmp_path, [{"result": "SUCCESS", "id": 555}])
+
+    _create_test_food(client, barcodes=["0 49000 05010 3", "4006381333931"])
+
+    data = state["payloads"][0]["data"]
+    assert data["barcodes"] == ["049000050103", "4006381333931"]
+
+
+def test_create_custom_food_without_barcodes_sends_empty_list(tmp_path):
+    client, state = make_cold_client(tmp_path, [{"result": "SUCCESS", "id": 555}])
+
+    _create_test_food(client)
+
+    assert state["payloads"][0]["data"]["barcodes"] == []
+
+
+def test_create_custom_food_bad_barcode_raises_before_request(tmp_path):
+    client, state = make_cold_client(tmp_path, [{"result": "SUCCESS", "id": 555}])
+
+    with pytest.raises(ValueError, match="check digit"):
+        _create_test_food(client, barcodes=["4006381333932"])
+    assert state["payloads"] == []
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("4006381333931", "4006381333931"),  # EAN-13
+        ("602652270284", "602652270284"),  # UPC-A (from a real get_food)
+        ("0 49000 05010 3", "049000050103"),  # UPC-A as printed on a label
+        ("9638-5074", "96385074"),  # EAN-8
+        # UPC-E, one per expansion rule (the sixth digit picks it). The first
+        # three aren't valid EAN-8s, so only the UPC-E check accepts them;
+        # under rule 5-9 the two check digits always coincide.
+        ("04252614", "04252614"),  # -> UPC-A 042100005264
+        ("01234531", "01234531"),  # -> UPC-A 012300000451
+        ("01234543", "01234543"),  # -> UPC-A 012340000053
+        ("01234565", "01234565"),  # -> UPC-A 012345000065
+        ("10012345678902", "10012345678902"),  # GTIN-14
+    ],
+)
+def test_normalize_barcodes_accepts_gtin_family(raw, expected):
+    assert _normalize_barcodes([raw]) == [expected]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "4006381333932",  # EAN-13, last digit off by one
+        "602652270285",  # UPC-A, wrong check digit
+        "04252615",  # neither a valid EAN-8 nor a valid UPC-E
+        "24252618",  # UPC-E check digit, but UPC-E only has number systems 0, 1
+        "01234566",  # rule 5-9: wrong check digit as EAN-8 and as UPC-E
+    ],
+)
+def test_normalize_barcodes_rejects_wrong_check_digit(raw):
+    with pytest.raises(ValueError, match="check digit"):
+        _normalize_barcodes([raw])
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "12345",  # no GTIN has 5 digits
+        "400638133393a",
+        "４００６３８１３３３９３１",  # full-width digits: isdigit() but not ASCII
+    ],
+)
+def test_normalize_barcodes_rejects_malformed(raw):
+    with pytest.raises(ValueError, match="must be 8, 12, 13 or 14 digits"):
+        _normalize_barcodes([raw])
+
+
+def test_normalize_barcodes_drops_duplicates():
+    assert _normalize_barcodes(["4006381333931", "4006 3813 3393 1"]) == [
+        "4006381333931"
+    ]
 
 
 def test_enrich_diary_no_servings_skips_lookup(tmp_path):

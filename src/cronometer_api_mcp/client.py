@@ -659,6 +659,7 @@ class CronometerClient:
         extra_nutrients: dict[int, float] | None = None,
         serving_name: str = "1 serving",
         serving_grams: float = 100.0,
+        barcodes: list[str] | None = None,
     ) -> dict:
         """Create a custom food in Cronometer.
 
@@ -676,9 +677,14 @@ class CronometerClient:
                 Must not reuse an ID already written by the named macro args
                 above; doing so raises ValueError rather than silently
                 duplicating or shadowing an entry.
+            barcodes: Product barcodes (EAN/UPC/GTIN) to attach; scanning one
+                in the app finds this food. Spaces and dashes are stripped and
+                the check digit verified; a bad code raises ValueError.
 
         Returns {"food_id": int, "measure_id": int | None}.
         """
+        barcodes = _normalize_barcodes(barcodes or [])
+
         # Cronometer stores nutrients per 100g -- normalize from per-serving.
         scale = 100.0 / serving_grams if serving_grams > 0 else 1.0
 
@@ -741,6 +747,7 @@ class CronometerClient:
                 "nutrients": nutrients,
                 "properties": {},
                 "foodTags": [],
+                "barcodes": barcodes,
             },
             "config": {"call_version": 1},
         }
@@ -831,6 +838,7 @@ class CronometerClient:
         serving_name: str | None = None,
         serving_grams: float | None = None,
         serving_quantity: float | None = None,
+        barcodes: list[str] | None = None,
     ) -> dict:
         """Edit a user-created custom food in place.
 
@@ -850,6 +858,9 @@ class CronometerClient:
         serving_name ("2 cookies") is moved into the quantity for the same
         reason. A quantity set without serving_grams keeps the total weight,
         so the per-unit weight changes.
+
+        barcodes replaces the food's whole barcode list ([] clears it) and is
+        validated like create_custom_food's.
 
         Returns {"food_id": int, "name": str}.
         """
@@ -882,8 +893,14 @@ class CronometerClient:
             if v is not None and not (math.isfinite(v) and v > 0):
                 raise ValueError(f"{label} must be a positive number, got {v!r}")
 
+        if barcodes is not None:
+            barcodes = _normalize_barcodes(barcodes)
+
         with self._food_lock(food_id):
             food = self._get_custom_food(food_id)
+
+            if barcodes is not None:
+                food["barcodes"] = barcodes
 
             if name is not None:
                 old_name = food.get("name")
@@ -1970,3 +1987,60 @@ def _meal_group_for_hour(hour: int) -> int:
         return 3  # Dinner
     else:
         return 4  # Snacks
+
+
+def _normalize_barcodes(barcodes: list[str]) -> list[str]:
+    """Validate product barcodes and return them as bare digit strings.
+
+    Accepts the GTIN family the app's scanner reads -- EAN-13, UPC-A (12),
+    EAN-8 or UPC-E (8) and GTIN-14 -- including the spaces or dashes the
+    digits are printed with under the bars ("0 12345 67890 5"). The check
+    digit is verified, so a digit misread off a label is rejected instead of
+    saved as a code that never scans. Duplicates are dropped. Bare digit
+    strings are what get_food reports for branded foods (["602652270284"]).
+    """
+    normalized: list[str] = []
+    for raw in barcodes:
+        code = re.sub(r"[\s-]", "", str(raw))
+        if not (code.isascii() and code.isdigit()) or len(code) not in (8, 12, 13, 14):
+            raise ValueError(
+                f"barcode {raw!r} must be 8, 12, 13 or 14 digits (EAN, UPC or GTIN)"
+            )
+        if not _has_valid_check_digit(code):
+            raise ValueError(
+                f"barcode {raw!r} has the wrong check digit (last digit); "
+                f"re-check the digits"
+            )
+        if code not in normalized:
+            normalized.append(code)
+    return normalized
+
+
+def _gtin_check_digit(body: str) -> int:
+    """GS1 check digit for `body`: weights 3, 1, 3, ... from the right."""
+    total = sum(int(d) * (1 if i % 2 else 3) for i, d in enumerate(reversed(body)))
+    return -total % 10
+
+
+def _has_valid_check_digit(code: str) -> bool:
+    if _gtin_check_digit(code[:-1]) == int(code[-1]):
+        return True
+    # An 8-digit code that isn't a valid EAN-8 can still be UPC-E, whose check
+    # digit is the one of the 12-digit UPC-A it abbreviates.
+    return (
+        len(code) == 8
+        and code[0] in "01"
+        and _gtin_check_digit(_expand_upc_e(code)) == int(code[-1])
+    )
+
+
+def _expand_upc_e(code: str) -> str:
+    """The UPC-A digits (check digit excluded) a UPC-E code abbreviates."""
+    system, d = code[0], code[1:7]
+    if d[5] in "012":
+        return system + d[0:2] + d[5] + "0000" + d[2:5]
+    if d[5] == "3":
+        return system + d[0:3] + "00000" + d[3:5]
+    if d[5] == "4":
+        return system + d[0:4] + "00000" + d[4]
+    return system + d[0:5] + "0000" + d[5]
